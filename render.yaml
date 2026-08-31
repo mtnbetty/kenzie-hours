@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: kenzie-hours
+    runtime: python
+    plan: starter
+    buildCommand: ""
+    startCommand: python3 app.py
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: kenzie-hours-data
+      mountPath: /var/data
+      sizeGB: 1
