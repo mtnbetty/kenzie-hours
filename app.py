@@ -158,15 +158,16 @@ TIMER_JS = """
 </script>"""
 
 def kenzie_page(con, flash=None):
+    kbase = "/k/" + KENZIE_TOKEN
     oe = open_entry(con)
     if oe:
         ci = parse(oe[1])
         status = f"You are <b>clocked in</b> since {fmt_time(ci)} ({fmt_day(ci)})"
-        btn = """<form method="post" action="clock"><button class="bigbtn out" type="submit">Clock Out</button></form>"""
+        btn = f"""<form method="post" action="{kbase}/clock"><button class="bigbtn out" type="submit">Clock Out</button></form>"""
         timer = f'<div class="timer" id="elapsed" data-start="{oe[1]}"></div>' + TIMER_JS
     else:
         status = "You are <b>clocked out</b>"
-        btn = """<form method="post" action="clock"><button class="bigbtn in" type="submit">Clock In</button></form>"""
+        btn = f"""<form method="post" action="{kbase}/clock"><button class="bigbtn in" type="submit">Clock In</button></form>"""
         timer = ""
     fl = f'<div class="flash {"err" if flash and flash.startswith("!") else ""}">{esc(flash.lstrip("!"))}</div>' if flash else ""
 
@@ -196,7 +197,7 @@ def kenzie_page(con, flash=None):
 </div>
 <div class="card">
   <h2 style="margin-top:0">Submit a receipt</h2>
-  <form method="post" action="receipt" enctype="multipart/form-data">
+  <form method="post" action="{kbase}/receipt" enctype="multipart/form-data">
     <label for="photo">Receipt photo</label>
     <input id="photo" name="photo" type="file" accept="image/*" capture="environment" required>
     <label for="amount">Amount (USD)</label>
@@ -212,6 +213,7 @@ def kenzie_page(con, flash=None):
     return PAGE.format(title="Clock In - Kenzie", body=body)
 
 def boss_page(con, flash=None):
+    bbase = "/boss/" + BOSS_TOKEN
     entries = entries_with_durations(con)
     weeks = group_weeks(entries)
     fl = f'<div class="flash {"err" if flash and flash.startswith("!") else ""}">{esc(flash.lstrip("!"))}</div>' if flash else ""
@@ -231,7 +233,7 @@ def boss_page(con, flash=None):
             out_cell = fmt_time(e["out"]) if e["out"] else "<b>still in</b>"
             rows += (f"<tr><td>{fmt_day(e['in'])}</td><td>{fmt_time(e['in'])}</td><td>{out_cell}</td>"
                      f"<td>{dur_str(e['secs'])}</td>"
-                     f'<td><form method="post" action="del_entry" onsubmit="return confirm(\'Delete this shift?\')">'
+                     f'<td><form method="post" action="{bbase}/del_entry" onsubmit="return confirm(\'Delete this shift?\')">'
                      f'<input type="hidden" name="id" value="{e["id"]}"><button class="delbtn" title="Delete">&#10005;</button></form></td></tr>')
         wk_html += f"""<div class="card"><table>
 <tr class="weekhead"><td colspan="5">Week of {ws.strftime("%b %-d, %Y")}</td></tr>
@@ -248,7 +250,7 @@ def boss_page(con, flash=None):
     for rid, c, a, n in receipts:
         rrows += (f'<tr><td><a href="photo/{rid}" target="_blank"><img class="thumb" src="photo/{rid}" loading="lazy"></a></td>'
                   f"<td>{fmt_dt(parse(c))}</td><td>{money(a)}</td><td>{esc(n)}</td>"
-                  f'<td><form method="post" action="del_receipt" onsubmit="return confirm(\'Delete this receipt?\')">'
+                  f'<td><form method="post" action="{bbase}/del_receipt" onsubmit="return confirm(\'Delete this receipt?\')">'
                   f'<input type="hidden" name="id" value="{rid}"><button class="delbtn" title="Delete">&#10005;</button></form></td></tr>')
     if not rrows:
         rrows = '<tr><td colspan="5" class="muted">No receipts submitted yet.</td></tr>'
