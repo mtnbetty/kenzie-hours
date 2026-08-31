@@ -5,6 +5,7 @@ services:
     plan: starter
     buildCommand: ""
     startCommand: python3 app.py
+    autoDeploy: true
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.7
