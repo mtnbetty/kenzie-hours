@@ -6,6 +6,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+import math_app
+
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
 DB_PATH = os.path.join(DATA_DIR, "hours.db")
@@ -31,16 +33,18 @@ def db():
 
 def load_tokens():
     kt, bt = os.environ.get("KENZIE_TOKEN"), os.environ.get("BOSS_TOKEN")
-    if kt and bt:
-        return kt, bt
-    if os.path.exists(TOKENS_PATH):
-        t = json.load(open(TOKENS_PATH))
-        return t["kenzie"], t["boss"]
-    kt, bt = secrets.token_urlsafe(18), secrets.token_urlsafe(18)
-    json.dump({"kenzie": kt, "boss": bt}, open(TOKENS_PATH, "w"))
-    return kt, bt
+    ft = os.environ.get("FAMILY_TOKEN")
+    if kt and bt and ft:
+        return kt, bt, ft
+    t = json.load(open(TOKENS_PATH)) if os.path.exists(TOKENS_PATH) else {}
+    kt = kt or t.get("kenzie") or secrets.token_urlsafe(18)
+    bt = bt or t.get("boss") or secrets.token_urlsafe(18)
+    ft = ft or t.get("family") or secrets.token_urlsafe(18)
+    t.update({"kenzie": kt, "boss": bt, "family": ft})
+    json.dump(t, open(TOKENS_PATH, "w"))
+    return kt, bt, ft
 
-KENZIE_TOKEN, BOSS_TOKEN = load_tokens()
+KENZIE_TOKEN, BOSS_TOKEN, FAMILY_TOKEN = load_tokens()
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -270,6 +274,56 @@ def boss_page(con, flash=None):
 """
     return PAGE.format(title="Employer view", body=body)
 
+
+HUB_PAGE = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#3d3654">
+<title>Family Hub</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: linear-gradient(160deg, #f6f4ff 0%, #eef7ff 100%); min-height: 100vh;
+  color: #241f3a; padding: 24px 16px; max-width: 560px; margin: 0 auto; }
+h1 { font-size: 1.7rem; text-align: center; margin: 12px 0 2px; }
+.sub { text-align: center; color: #6b6685; margin-bottom: 24px; }
+.card { display: block; text-decoration: none; color: inherit; background: #fff;
+  border-radius: 22px; padding: 26px 22px; margin-bottom: 18px;
+  box-shadow: 0 3px 10px rgba(60,40,120,.12); }
+a.card:active { transform: scale(.98); }
+.emoji { font-size: 2.6rem; }
+.name { font-size: 1.4rem; font-weight: 800; margin: 6px 0 2px; }
+.desc { color: #6b6685; }
+.soon { opacity: .55; }
+.badge { display: inline-block; background: #ece8fb; color: #7b5cff; font-weight: 700;
+  font-size: .8rem; border-radius: 99px; padding: 4px 12px; margin-top: 8px;
+  text-transform: uppercase; letter-spacing: .06em; }
+</style></head><body>
+<h1>&#127968; Family Hub</h1>
+<div class="sub">Pick your name to get to your stuff</div>
+<a class="card" href="/k/{kt}">
+  <div class="emoji">&#9200;</div>
+  <div class="name">Kenzie</div>
+  <div class="desc">Clock in &amp; out, send receipts</div>
+</a>
+<a class="card" href="/g/{gt}">
+  <div class="emoji">&#129518;</div>
+  <div class="name">Goldie</div>
+  <div class="desc">Your daily math mission</div>
+</a>
+<div class="card soon">
+  <div class="emoji">&#127752;</div>
+  <div class="name">Josie</div>
+  <div class="desc">Something fun is on the way</div>
+  <div class="badge">Coming soon</div>
+</div>
+</body></html>"""
+
+def family_page():
+    return HUB_PAGE.replace("{kt}", KENZIE_TOKEN).replace("{gt}", math_app.GOLDIE_TOKEN)
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -295,6 +349,12 @@ class H(BaseHTTPRequestHandler):
     def _parts(self):
         return [p for p in urlparse(self.path).path.split("/") if p]
 
+    def _post_fields(self):
+        from urllib.parse import parse_qs as _pq
+        ln = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(ln).decode()
+        return {k: v[0] for k, v in _pq(body).items()}
+
     def do_GET(self):
         parts = self._parts()
         q = urlparse(self.path).query
@@ -302,6 +362,12 @@ class H(BaseHTTPRequestHandler):
         if "msg=" in q:
             from urllib.parse import parse_qs
             msg = parse_qs(q).get("msg", [None])[0]
+        if math_app.wants(parts):
+            math_app.do_get(self, parts, msg)
+            return
+        if parts == ["family", FAMILY_TOKEN]:
+            self._send(200, family_page())
+            return
         con = db()
         try:
             if parts == ["healthz"]:
@@ -327,6 +393,9 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parts = self._parts()
+        if math_app.wants(parts):
+            math_app.do_post(self, parts)
+            return
         con = db()
         try:
             if len(parts) == 3 and parts[0] == "k" and parts[1] == KENZIE_TOKEN and parts[2] == "clock":
@@ -395,5 +464,6 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     print(f"KENZIE_URL_PATH=/k/{KENZIE_TOKEN}")
     print(f"BOSS_URL_PATH=/boss/{BOSS_TOKEN}")
+    print(f"FAMILY_URL_PATH=/family/{FAMILY_TOKEN}")
     print(f"listening on :{PORT}")
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
