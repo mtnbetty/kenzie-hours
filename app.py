@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-import math_app, josie_app, reading_app
+import math_app, josie_app, reading_app, chores_app
 
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
@@ -163,6 +163,11 @@ TIMER_JS = """
 
 def kenzie_page(con, flash=None):
     kbase = "/k/" + KENZIE_TOKEN
+    ccon = chores_app.db()
+    try:
+        chores_card = chores_app.kid_card(ccon, kbase, "kenzie")
+    finally:
+        ccon.close()
     oe = open_entry(con)
     if oe:
         ci = parse(oe[1])
@@ -199,6 +204,7 @@ def kenzie_page(con, flash=None):
   {timer}
   {btn}
 </div>
+{chores_card}
 <div class="card">
   <h2 style="margin-top:0">Submit a receipt</h2>
   <form method="post" action="{kbase}/receipt" enctype="multipart/form-data">
@@ -326,6 +332,11 @@ def dashboard_page(flash=None):
         kenzie_html = boss_sections(con)
     finally:
         con.close()
+    ccon = chores_app.db()
+    try:
+        chores_html = chores_app.parent_section(ccon, BOSS_TOKEN)
+    finally:
+        ccon.close()
     rcon = reading_app.db()
     try:
         reading_html = reading_app.parent_section(rcon)
@@ -346,11 +357,13 @@ def dashboard_page(flash=None):
 <div class="sub">All three kids in one place - refreshes each time you open it</div>
 {fl}
 <div class="nav">
+  <a href="#chores">Chores</a>
   <a href="#kenzie">Kenzie - hours</a>
   <a href="#reading">Reading</a>
   <a href="#goldie">Goldie - math</a>
   <a href="#josie">Josie - math</a>
 </div>
+{chores_html}
 <h2 id="kenzie">Kenzie - hours &amp; receipts</h2>
 {kenzie_html}
 <div id="reading"></div>
@@ -393,24 +406,44 @@ a.card:active { transform: scale(.98); }
 <a class="card" href="/k/{kt}">
   <div class="emoji">&#9200;</div>
   <div class="name">Kenzie</div>
-  <div class="desc">Clock in &amp; out, send receipts</div>
+  <div class="desc">Clock in &amp; out, receipts, today's tasks</div>
+  {kb}
 </a>
 <a class="card" href="/g/{gt}">
   <div class="emoji">&#129518;</div>
   <div class="name">Goldie</div>
-  <div class="desc">Your daily math mission + reading</div>
+  <div class="desc">Your daily math mission + reading + tasks</div>
+  {gb}
 </a>
 <a class="card" href="/j/{jt}">
   <div class="emoji">&#128208;</div>
   <div class="name">Josie</div>
-  <div class="desc">Daily math practice + reading</div>
+  <div class="desc">Daily math practice + reading + tasks</div>
+  {jb}
 </a>
 </body></html>"""
 
+def _chores_badge(left):
+    return f'<div class="badge">{left} task{"s" if left != 1 else ""} left today</div>' if left else ""
+
 def family_page():
+    ccon = chores_app.db()
+    try:
+        left = {k: chores_app.remaining_count(ccon, k) for k in ("kenzie", "goldie", "josie")}
+    finally:
+        ccon.close()
     return (HUB_PAGE.replace("{kt}", KENZIE_TOKEN)
             .replace("{gt}", math_app.GOLDIE_TOKEN)
-            .replace("{jt}", josie_app.JOSIE_TOKEN))
+            .replace("{jt}", josie_app.JOSIE_TOKEN)
+            .replace("{kb}", _chores_badge(left["kenzie"]))
+            .replace("{gb}", _chores_badge(left["goldie"]))
+            .replace("{jb}", _chores_badge(left["josie"])))
+
+def dash_back(h):
+    ref = h.headers.get("Referer", "") or ""
+    if f"/parent/{math_app.PARENT_TOKEN}" in ref:
+        return f"/parent/{math_app.PARENT_TOKEN}"
+    return f"/boss/{BOSS_TOKEN}"
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -468,6 +501,21 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, "ok", "text/plain")
             elif parts == ["k", KENZIE_TOKEN]:
                 self._send(200, kenzie_page(con, msg))
+            elif len(parts) == 4 and parts[0] == "boss" and parts[1] == BOSS_TOKEN and parts[2] == "chore_edit":
+                try:
+                    tid = int(parts[3])
+                except ValueError:
+                    tid = -1
+                ccon = chores_app.db()
+                try:
+                    ebody = chores_app.edit_body(ccon, tid, BOSS_TOKEN)
+                finally:
+                    ccon.close()
+                if ebody is None:
+                    self._send(404, "not found", "text/plain")
+                else:
+                    self._send(200, DASH_PAGE.format(title="Edit task",
+                        body=ebody.replace("PARENTTOKEN_PLACEHOLDER", math_app.PARENT_TOKEN)))
             elif len(parts) == 4 and parts[0] == "boss" and parts[1] == BOSS_TOKEN and parts[2] == "photo":
                 rid = int(parts[3])
                 row = con.execute("SELECT filename FROM receipts WHERE id=?", (rid,)).fetchone()
@@ -503,6 +551,63 @@ class H(BaseHTTPRequestHandler):
                     msg = "Clocked in - have a great shift!"
                 con.commit()
                 self._redirect(f"/k/{KENZIE_TOKEN}", msg)
+            elif len(parts) == 3 and parts[0] == "k" and parts[1] == KENZIE_TOKEN and parts[2] == "chore":
+                f = self._post_fields()
+                ccon = chores_app.db()
+                try:
+                    done = chores_app.toggle(ccon, int(f.get("task_id", "0") or 0), "kenzie")
+                finally:
+                    ccon.close()
+                if done is None:
+                    self._redirect(f"/k/{KENZIE_TOKEN}", "!That task isn't on your list today")
+                else:
+                    self._redirect(f"/k/{KENZIE_TOKEN}", "Nice - task done." if done else "Marked as not done.")
+            elif len(parts) == 3 and parts[0] == "boss" and parts[1] == BOSS_TOKEN and parts[2] == "chore_add":
+                f = self._post_fields()
+                ccon = chores_app.db()
+                try:
+                    try:
+                        title, kids, kind, date_s, dows = chores_app.parse_task_form(f)
+                    except ValueError as ve:
+                        self._redirect(dash_back(self), f"!{ve}")
+                        return
+                    chores_app.add_task(ccon, title, kids, kind, date_s, dows)
+                finally:
+                    ccon.close()
+                who = ", ".join(chores_app.KID_LABEL[k] for k in kids)
+                self._redirect(dash_back(self), f"Task added for {who}")
+            elif len(parts) == 3 and parts[0] == "boss" and parts[1] == BOSS_TOKEN and parts[2] == "chore_save":
+                f = self._post_fields()
+                ccon = chores_app.db()
+                try:
+                    try:
+                        title, kids, kind, date_s, dows = chores_app.parse_task_form(f)
+                    except ValueError as ve:
+                        self._redirect(dash_back(self), f"!{ve}")
+                        return
+                    tid = int(f.get("id", "0") or 0)
+                    ccon.execute("UPDATE tasks SET title=?, kind=?, date=?, dow=? WHERE id=?",
+                                 (title, kind, date_s if kind == "once" else None,
+                                  ",".join(str(d) for d in dows) if kind == "weekly" else None, tid))
+                    ccon.execute("DELETE FROM task_kids WHERE task_id=?", (tid,))
+                    for k in kids:
+                        ccon.execute("INSERT OR IGNORE INTO task_kids(task_id, kid) VALUES (?,?)", (tid, k))
+                    ccon.commit()
+                finally:
+                    ccon.close()
+                self._redirect(dash_back(self), "Task updated")
+            elif len(parts) == 3 and parts[0] == "boss" and parts[1] == BOSS_TOKEN and parts[2] == "chore_del":
+                f = self._post_fields()
+                tid = int(f.get("id", "0") or 0)
+                ccon = chores_app.db()
+                try:
+                    ccon.execute("DELETE FROM completions WHERE task_id=?", (tid,))
+                    ccon.execute("DELETE FROM task_kids WHERE task_id=?", (tid,))
+                    ccon.execute("DELETE FROM tasks WHERE id=?", (tid,))
+                    ccon.commit()
+                finally:
+                    ccon.close()
+                self._redirect(dash_back(self), "Task deleted")
             elif len(parts) == 3 and parts[0] == "k" and parts[1] == KENZIE_TOKEN and parts[2] == "receipt":
                 ctype = self.headers.get("Content-Type", "")
                 if "multipart/form-data" not in ctype:
