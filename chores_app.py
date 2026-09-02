@@ -190,7 +190,7 @@ def add_form(bbase, today_s):
     <label style="display:block;font-size:.85rem;color:#555;margin:6px 0 4px">Repeat</label>
     <select name="kind" style="{_INPUT}">{_kind_options("once")}</select>
     <div style="margin-bottom:6px">{_dow_checks(())}</div>
-    <button class="subbtn" type="submit">Add task</button>
+    <button style="display:block;width:100%;border:0;border-radius:12px;padding:15px 0;font-size:1.08rem;font-weight:600;color:#fff;background:#2f6fed;cursor:pointer;margin-top:6px" type="submit">Add task</button>
   </form>
 </div>"""
 
@@ -272,7 +272,7 @@ def edit_body(con, task_id, boss_token):
     <label style="display:block;font-size:.85rem;color:#555;margin:6px 0 4px">Repeat</label>
     <select name="kind" style="{_INPUT}">{_kind_options(kind)}</select>
     <div style="margin-bottom:6px">{_dow_checks(dows)}</div>
-    <button class="subbtn" type="submit">Save task</button>
+    <button style="display:block;width:100%;border:0;border-radius:12px;padding:15px 0;font-size:1.08rem;font-weight:600;color:#fff;background:#2f6fed;cursor:pointer;margin-top:6px" type="submit">Save task</button>
   </form>
 </div>"""
 
