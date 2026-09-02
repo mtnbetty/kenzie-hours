@@ -17,7 +17,7 @@ from fractions import Fraction
 from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
 
-import reading_app
+import reading_app, chores_app
 
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 DB_PATH = os.path.join(DATA_DIR, "josie.db")
@@ -45,6 +45,9 @@ def db():
         day TEXT NOT NULL UNIQUE,
         started TEXT NOT NULL,
         finished TEXT)""")
+    cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)")]
+    if "mood" not in cols:
+        con.execute("ALTER TABLE sessions ADD COLUMN mood TEXT")
     con.execute("""CREATE TABLE IF NOT EXISTS problems(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id INTEGER NOT NULL,
@@ -256,17 +259,17 @@ def parse_answer(s):
 
 def get_or_create_session(con):
     day = today_local()
-    row = con.execute("SELECT id, day, started, finished FROM sessions WHERE day=?",
+    row = con.execute("SELECT id, day, started, finished, mood FROM sessions WHERE day=?",
                       (day.isoformat(),)).fetchone()
     if row:
-        return {"id": row[0], "day": row[1], "started": row[2], "finished": row[3]}
+        return {"id": row[0], "day": row[1], "started": row[2], "finished": row[3], "mood": row[4]}
     con.execute("INSERT INTO sessions(day, started) VALUES (?,?)", (day.isoformat(), iso(now_utc())))
     sid = con.execute("SELECT id FROM sessions WHERE day=?", (day.isoformat(),)).fetchone()[0]
     for i, (skill, prompt, answer) in enumerate(gen_problems(con, day)):
         con.execute("INSERT INTO problems(session_id, idx, skill, prompt, answer) VALUES (?,?,?,?,?)",
                     (sid, i, skill, prompt, answer))
     con.commit()
-    return {"id": sid, "day": day.isoformat(), "started": iso(now_utc()), "finished": None}
+    return {"id": sid, "day": day.isoformat(), "started": iso(now_utc()), "finished": None, "mood": None}
 
 def current_problem(con, sid):
     row = con.execute("""SELECT id, idx, skill, prompt, answer, josie_answer, correct, attempts
@@ -361,6 +364,10 @@ a {{ color: #0e7490; }}
 .stat .n {{ font-size: 1.5rem; font-weight: 800; }}
 .stat .l {{ font-size: .72rem; color: #6c7f89; text-transform: uppercase; letter-spacing: .05em; }}
 h2 {{ font-size: 1.02rem; margin: 22px 0 8px; color: #44606e; }}
+.moods {{ display: flex; gap: 12px; justify-content: center; margin: 12px 0 4px; }}
+.moods button {{ font-size: 2rem; background: #eef4f6; border: 2px solid transparent;
+  border-radius: 12px; padding: 8px 12px; cursor: pointer; }}
+.moods button:active {{ border-color: #0e7490; }}
 .subbtn {{ display: block; width: 100%; border: 0; border-radius: 12px; padding: 14px 0;
   font-size: 1.05rem; font-weight: 600; color: #fff; background: #0e7490; cursor: pointer; }}
 </style></head><body>
@@ -389,6 +396,11 @@ def josie_home(con, msg=None):
         rcon.close()
     reading_card = reading_app.kid_card(jbase, "josie", r_already, r_streak,
                                         "I read for 30 minutes")
+    ccon = chores_app.db()
+    try:
+        chores_card = chores_app.kid_card(ccon, jbase, "josie")
+    finally:
+        ccon.close()
 
     if srow and srow[1]:
         done, right, first = session_stats(con, srow[0])
@@ -402,6 +414,7 @@ def josie_home(con, msg=None):
   <div class="status">Today's set: <b>{right} of {total}</b> right, {first} on the first try.</div>
   <div class="muted">New set tomorrow. Your mom can see the results.</div>
 </div>
+{chores_card}
 {reading_card}"""
         return PAGE.format(title="Josie Math", body=body)
 
@@ -419,6 +432,7 @@ def josie_home(con, msg=None):
   <div class="muted center" style="margin-bottom:12px">{done} of {total} done</div>
   <form method="post" action="{jbase}/play"><button class="bigbtn" type="submit">Keep going</button></form>
 </div>
+{chores_card}
 {reading_card}"""
         return PAGE.format(title="Josie Math", body=body)
 
@@ -429,9 +443,16 @@ def josie_home(con, msg=None):
 {fl}
 {streak_line}
 <div class="card">
-  <div class="muted" style="margin-bottom:14px">Today's mix: {mixline}. One at a time, two tries each. It saves your progress if you need a break.</div>
-  <form method="post" action="{jbase}/play"><button class="bigbtn" type="submit">Start today's set</button></form>
+  <div class="status">How are you feeling today?</div>
+  <div class="moods">
+    <form method="post" action="{jbase}/start"><input type="hidden" name="mood" value="great"><button type="submit">&#128513;</button></form>
+    <form method="post" action="{jbase}/start"><input type="hidden" name="mood" value="ok"><button type="submit">&#128528;</button></form>
+    <form method="post" action="{jbase}/start"><input type="hidden" name="mood" value="tired"><button type="submit">&#128564;</button></form>
+  </div>
+  <div class="muted center" style="margin:10px 0 14px">Pick one to check in - your set starts right after</div>
+  <div class="muted">Today's mix: {mixline}. One at a time, two tries each. It saves your progress if you need a break.</div>
 </div>
+{chores_card}
 {reading_card}"""
     return PAGE.format(title="Josie Math", body=body)
 
@@ -497,18 +518,20 @@ def parent_sections(con, parent_token):
 <tr><th>Skill</th><th>Right</th><th></th><th>%</th><th>Level</th></tr>{sk_rows}</table>
 <div class="muted" style="margin-top:6px">Levels rise as her accuracy climbs - higher level, harder problems. Weak skills automatically get extra reps.</div></div>"""
 
-    sess = con.execute("SELECT id, day, started, finished FROM sessions ORDER BY day DESC LIMIT 30").fetchall()
+    sess = con.execute("SELECT id, day, started, finished, mood FROM sessions ORDER BY day DESC LIMIT 30").fetchall()
+    mood_map = {"great": "&#128513;", "ok": "&#128528;", "tired": "&#128564;"}
     srows = ""
-    for sid, d, started, finished in sess:
+    for sid, d, started, finished, mood in sess:
         done, right, first = session_stats(con, sid)
         total = con.execute("SELECT COUNT(*) FROM problems WHERE session_id=?", (sid,)).fetchone()[0]
         state = "done" if finished else ("in progress" if done else "not started")
         mins = f"{(parse(finished)-parse(started)).total_seconds()/60:.0f} min" if started and finished else "-"
         srows += (f'<tr><td><a href="{pbase}/jsession/{sid}">{fmt_day(d)}</a></td>'
+                  f"<td>{mood_map.get(mood, '')}</td>"
                   f"<td>{right}/{done or total}</td><td>{mins}</td><td>{state}</td></tr>")
     sess_html = f"""<div class="card"><table>
-<tr><th>Day</th><th>Score</th><th>Time</th><th>Status</th></tr>
-{srows or '<tr><td colspan="4" class="muted">No sessions yet.</td></tr>'}</table>
+<tr><th>Day</th><th>Mood</th><th>Score</th><th>Time</th><th>Status</th></tr>
+{srows or '<tr><td colspan="5" class="muted">No sessions yet.</td></tr>'}</table>
 <div class="muted" style="margin-top:6px">Tap a day for every problem and her answers.</div></div>"""
 
     return f"""<h2 id="josie">Josie's math (8th grade)</h2>
@@ -517,13 +540,16 @@ def parent_sections(con, parent_token):
 {sess_html}"""
 
 def session_page(con, sid, parent_token):
-    s = con.execute("SELECT day, started, finished FROM sessions WHERE id=?", (sid,)).fetchone()
+    s = con.execute("SELECT day, started, finished, mood FROM sessions WHERE id=?", (sid,)).fetchone()
     if not s:
         return None
     done, right, first = session_stats(con, sid)
     total = con.execute("SELECT COUNT(*) FROM problems WHERE session_id=?", (sid,)).fetchone()[0]
     probs = con.execute("""SELECT idx, skill, prompt, answer, josie_answer, correct, first_try, attempts, seconds
                            FROM problems WHERE session_id=? ORDER BY idx""", (sid,)).fetchall()
+    mood_sub = ""
+    if len(s) > 3 and s[3]:
+        mood_sub = " &middot; mood: " + {"great": "&#128513;", "ok": "&#128528;", "tired": "&#128564;"}.get(s[3], "")
     rows = ""
     for idx, skill, prompt, ans, jans, correct, ft, att, secs in probs:
         if correct is None:
@@ -540,7 +566,7 @@ def session_page(con, sid, parent_token):
                  f"<td>{jcell}</td><td>{mark}</td><td>{tcell}</td></tr>")
     body = f"""
 <h1>Josie - {fmt_day(s[0])} - {right} of {total} right</h1>
-<div class="sub">{first} on the first try &middot; <a href="/parent/{parent_token}">back to the dashboard</a></div>
+<div class="sub">{first} on the first try{mood_sub} &middot; <a href="/parent/{parent_token}">back to the dashboard</a></div>
 <div class="card"><table>
 <tr><th>Problem</th><th>Skill</th><th>Her answer</th><th></th><th>Time</th></tr>
 {rows}
@@ -583,10 +609,27 @@ def do_post(h, parts):
             rcon.close()
         h._redirect(f"/j/{JOSIE_TOKEN}", "+Reading logged - 30 minutes, done." if new else "Reading was already logged today.")
         return
+    if len(parts) == 3 and parts[0] == "j" and parts[1] == JOSIE_TOKEN and parts[2] == "chore":
+        f = h._post_fields()
+        ccon = chores_app.db()
+        try:
+            done = chores_app.toggle(ccon, int(f.get("task_id", "0") or 0), "josie")
+        finally:
+            ccon.close()
+        if done is None:
+            h._redirect(f"/j/{JOSIE_TOKEN}", "!That task isn't on your list today")
+        else:
+            h._redirect(f"/j/{JOSIE_TOKEN}", "+Nice - task done." if done else "Marked as not done.")
+        return
     con = db()
     try:
         if len(parts) == 3 and parts[0] == "j" and parts[1] == JOSIE_TOKEN and parts[2] in ("start", "play"):
-            get_or_create_session(con)
+            f = h._post_fields()
+            s = get_or_create_session(con)
+            mood = f.get("mood", "")
+            if mood in ("great", "ok", "tired") and not s.get("mood"):
+                con.execute("UPDATE sessions SET mood=? WHERE id=? AND mood IS NULL", (mood, s["id"]))
+                con.commit()
             h._redirect(f"/j/{JOSIE_TOKEN}/play")
         elif len(parts) == 3 and parts[0] == "j" and parts[1] == JOSIE_TOKEN and parts[2] == "answer":
             f = h._post_fields()
