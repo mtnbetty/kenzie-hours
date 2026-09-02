@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-import math_app
+import math_app, josie_app, reading_app
 
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
@@ -216,11 +216,10 @@ def kenzie_page(con, flash=None):
 """
     return PAGE.format(title="Clock In - Kenzie", body=body)
 
-def boss_page(con, flash=None):
+def boss_sections(con):
     bbase = "/boss/" + BOSS_TOKEN
     entries = entries_with_durations(con)
     weeks = group_weeks(entries)
-    fl = f'<div class="flash {"err" if flash and flash.startswith("!") else ""}">{esc(flash.lstrip("!"))}</div>' if flash else ""
 
     oe = open_entry(con)
     status_html = ""
@@ -259,10 +258,7 @@ def boss_page(con, flash=None):
     if not rrows:
         rrows = '<tr><td colspan="5" class="muted">No receipts submitted yet.</td></tr>'
 
-    body = f"""
-<h1>Kristy - Kenzie's hours</h1>
-<div class="sub">Employer view - refreshes each time you open it</div>
-{fl}
+    return f"""
 {status_html}
 <h2>Hours by week</h2>
 {wk_html}
@@ -272,7 +268,98 @@ def boss_page(con, flash=None):
 {rrows}
 </table></div>
 """
-    return PAGE.format(title="Employer view", body=body)
+
+
+DASH_PAGE = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#3d3654">
+<title>{title}</title>
+<style>
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #f4f5f7; color: #1c1e21; padding: 16px; max-width: 640px; margin: 0 auto; }}
+h1 {{ font-size: 1.35rem; margin: 8px 0 4px; }}
+h2 {{ font-size: 1.05rem; margin: 26px 0 8px; color: #444; padding-top: 8px; }}
+.sub {{ color: #666; font-size: .9rem; margin-bottom: 10px; }}
+.nav {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }}
+.nav a {{ background: #fff; border-radius: 99px; padding: 8px 14px; font-size: .85rem;
+  font-weight: 600; color: #2f6fed; text-decoration: none; box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
+.card {{ background: #fff; border-radius: 14px; padding: 18px; margin-bottom: 14px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
+.status {{ text-align: center; font-size: 1.05rem; margin-bottom: 14px; }}
+.timer {{ text-align: center; font-size: 2rem; font-weight: 700; margin: 6px 0 16px;
+  font-variant-numeric: tabular-nums; }}
+table {{ width: 100%; border-collapse: collapse; font-size: .92rem; }}
+th, td {{ text-align: left; padding: 7px 6px; border-bottom: 1px solid #eee; }}
+th {{ color: #777; font-weight: 600; font-size: .8rem; text-transform: uppercase; }}
+.totalrow td {{ font-weight: 700; border-bottom: none; }}
+.thumb {{ width: 64px; height: 64px; object-fit: cover; border-radius: 8px; }}
+.flash {{ background: #e7f6ec; color: #166b34; border-radius: 10px; padding: 12px;
+  text-align: center; margin-bottom: 14px; font-weight: 600; }}
+.err {{ background: #fdecea; color: #a32; }}
+.delbtn {{ border: 0; background: none; color: #c00; font-size: 1rem; cursor: pointer; padding: 4px; }}
+.muted {{ color: #888; font-size: .85rem; }}
+.weekhead {{ background: #eceff3; font-weight: 700; }}
+.statgrid {{ display: flex; gap: 10px; margin-bottom: 14px; }}
+.stat {{ flex: 1; background: #fff; border-radius: 14px; padding: 14px 10px; text-align: center;
+  box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
+.stat .n {{ font-size: 1.6rem; font-weight: 800; }}
+.stat .l {{ font-size: .75rem; color: #777; text-transform: uppercase; letter-spacing: .05em; }}
+.bar {{ background: #e7e2fa; border-radius: 6px; height: 10px; overflow: hidden; min-width: 80px; }}
+.bar > div {{ background: #7b5cff; height: 100%; }}
+.yes {{ color: #177a3f; font-weight: 700; }}
+.no {{ color: #c0392b; font-weight: 700; }}
+a {{ color: #2f6fed; }}
+</style></head><body>
+{body}
+</body></html>"""
+
+def dashboard_page(flash=None):
+    """Unified parent dashboard: Kenzie's hours + receipts, reading log, both math apps."""
+    fl = (f'<div class="flash {"err" if flash and flash.startswith("!") else ""}">{esc(flash.lstrip("!"))}</div>'
+          if flash else "")
+    con = db()
+    try:
+        kenzie_html = boss_sections(con)
+    finally:
+        con.close()
+    rcon = reading_app.db()
+    try:
+        reading_html = reading_app.parent_section(rcon)
+    finally:
+        rcon.close()
+    mcon = math_app.db()
+    try:
+        goldie_html = math_app.parent_sections(mcon)
+    finally:
+        mcon.close()
+    jcon = josie_app.db()
+    try:
+        josie_html = josie_app.parent_sections(jcon, math_app.PARENT_TOKEN)
+    finally:
+        jcon.close()
+    body = f"""
+<h1>Family dashboard</h1>
+<div class="sub">All three kids in one place - refreshes each time you open it</div>
+{fl}
+<div class="nav">
+  <a href="#kenzie">Kenzie - hours</a>
+  <a href="#reading">Reading</a>
+  <a href="#goldie">Goldie - math</a>
+  <a href="#josie">Josie - math</a>
+</div>
+<h2 id="kenzie">Kenzie - hours &amp; receipts</h2>
+{kenzie_html}
+<div id="reading"></div>
+{reading_html}
+<h2 id="goldie">Goldie's math (6th grade)</h2>
+{goldie_html}
+{josie_html}
+"""
+    return DASH_PAGE.format(title="Family dashboard", body=body)
 
 
 HUB_PAGE = """<!DOCTYPE html>
@@ -311,18 +398,19 @@ a.card:active { transform: scale(.98); }
 <a class="card" href="/g/{gt}">
   <div class="emoji">&#129518;</div>
   <div class="name">Goldie</div>
-  <div class="desc">Your daily math mission</div>
+  <div class="desc">Your daily math mission + reading</div>
 </a>
-<div class="card soon">
-  <div class="emoji">&#127752;</div>
+<a class="card" href="/j/{jt}">
+  <div class="emoji">&#128208;</div>
   <div class="name">Josie</div>
-  <div class="desc">Something fun is on the way</div>
-  <div class="badge">Coming soon</div>
-</div>
+  <div class="desc">Daily math practice + reading</div>
+</a>
 </body></html>"""
 
 def family_page():
-    return HUB_PAGE.replace("{kt}", KENZIE_TOKEN).replace("{gt}", math_app.GOLDIE_TOKEN)
+    return (HUB_PAGE.replace("{kt}", KENZIE_TOKEN)
+            .replace("{gt}", math_app.GOLDIE_TOKEN)
+            .replace("{jt}", josie_app.JOSIE_TOKEN))
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -362,11 +450,17 @@ class H(BaseHTTPRequestHandler):
         if "msg=" in q:
             from urllib.parse import parse_qs
             msg = parse_qs(q).get("msg", [None])[0]
+        if parts == ["family", FAMILY_TOKEN]:
+            self._send(200, family_page())
+            return
+        if parts == ["boss", BOSS_TOKEN] or parts == ["parent", math_app.PARENT_TOKEN]:
+            self._send(200, dashboard_page(msg))
+            return
         if math_app.wants(parts):
             math_app.do_get(self, parts, msg)
             return
-        if parts == ["family", FAMILY_TOKEN]:
-            self._send(200, family_page())
+        if josie_app.wants(parts):
+            josie_app.do_get(self, parts, msg)
             return
         con = db()
         try:
@@ -374,8 +468,6 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, "ok", "text/plain")
             elif parts == ["k", KENZIE_TOKEN]:
                 self._send(200, kenzie_page(con, msg))
-            elif parts == ["boss", BOSS_TOKEN]:
-                self._send(200, boss_page(con, msg))
             elif len(parts) == 4 and parts[0] == "boss" and parts[1] == BOSS_TOKEN and parts[2] == "photo":
                 rid = int(parts[3])
                 row = con.execute("SELECT filename FROM receipts WHERE id=?", (rid,)).fetchone()
@@ -395,6 +487,9 @@ class H(BaseHTTPRequestHandler):
         parts = self._parts()
         if math_app.wants(parts):
             math_app.do_post(self, parts)
+            return
+        if josie_app.wants(parts):
+            josie_app.do_post(self, parts)
             return
         con = db()
         try:
@@ -465,5 +560,6 @@ if __name__ == "__main__":
     print(f"KENZIE_URL_PATH=/k/{KENZIE_TOKEN}")
     print(f"BOSS_URL_PATH=/boss/{BOSS_TOKEN}")
     print(f"FAMILY_URL_PATH=/family/{FAMILY_TOKEN}")
+    print(f"JOSIE_URL_PATH=/j/{josie_app.JOSIE_TOKEN}")
     print(f"listening on :{PORT}")
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
