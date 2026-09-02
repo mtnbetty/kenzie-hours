@@ -15,6 +15,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from zoneinfo import ZoneInfo
 
+import reading_app, josie_app
+
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 DB_PATH = os.path.join(DATA_DIR, "math.db")
 TOKENS_PATH = os.path.join(DATA_DIR, "math-tokens.json")
@@ -202,6 +204,7 @@ h2 {{ font-size: 1.05rem; margin: 24px 0 8px; color: #555; }}
 .bigbtn {{ display: block; width: 100%; border: 0; border-radius: 18px; padding: 26px 0;
   font-size: 1.5rem; font-weight: 800; color: #fff; background: #7b5cff; cursor: pointer; }}
 .bigbtn:active {{ transform: scale(.98); }}
+.readbtn {{ background: #2e9e5b; }}
 .status {{ text-align: center; font-size: 1.1rem; margin-bottom: 12px; }}
 .problem {{ text-align: center; font-size: 3.2rem; font-weight: 800; margin: 14px 0;
   font-variant-numeric: tabular-nums; letter-spacing: .02em; }}
@@ -275,6 +278,14 @@ def goldie_home(con, msg=None):
     fl = flash_html(msg)
     st = streak(con)
     stars = total_stars(con)
+    rcon = reading_app.db()
+    try:
+        r_already = reading_app.checked_today(rcon, "goldie")
+        r_streak = reading_app.streak(rcon, "goldie")
+    finally:
+        rcon.close()
+    reading_card = reading_app.kid_card(gbase, "goldie", r_already, r_streak,
+                                        "I read for 30 minutes! &#128214;")
     streak_line = ""
     if st > 0:
         streak_line = f'<div class="status">&#128293; <b>{st}-day streak!</b> &nbsp; &#11088; {stars} stars earned</div>'
@@ -294,8 +305,9 @@ def goldie_home(con, msg=None):
   ({first} on the first try).</div>
   <div class="muted">Come back tomorrow to keep your streak going. Your mom can see how you did.</div>
 </div>
+{reading_card}
 {{confetti}}"""
-        return PAGE.format(title="Goldie Math", body=body.format(confetti=CONFETTI_JS))
+        return PAGE.format(title="Goldie Math", body=body.format(confetti=CONFETTI_JS, reading_card=reading_card))
 
     if srow:
         done, right, first = session_stats(con, srow[0])
@@ -309,7 +321,8 @@ def goldie_home(con, msg=None):
   <div class="progress"><div style="width:{pct}%"></div></div>
   <div class="muted center" style="margin-bottom:12px">{done} of {PROBLEMS_PER_DAY} done - keep going!</div>
   <form method="post" action="{gbase}/play"><button class="bigbtn" type="submit">Keep going</button></form>
-</div>"""
+</div>
+{reading_card}"""
         return PAGE.format(title="Goldie Math", body=body)
 
     body = f"""
@@ -331,7 +344,8 @@ def goldie_home(con, msg=None):
     &#10148; {N_2X2} two-digit times two-digit<br>
     &#10148; {N_3X2} big ones: three-digit times two-digit
   </div>
-</div>"""
+</div>
+{reading_card}"""
     return PAGE.format(title="Goldie Math", body=body)
 
 def play_page(con, msg=None):
@@ -364,7 +378,7 @@ def play_page(con, msg=None):
 """
     return PAGE.format(title=f"Problem {n}", body=body)
 
-def parent_page(con):
+def parent_sections(con):
     pbase = f"/parent/{PARENT_TOKEN}"
     st = streak(con)
     stars = total_stars(con)
@@ -425,13 +439,18 @@ def parent_page(con):
 {srows or '<tr><td colspan="5" class="muted">No sessions yet.</td></tr>'}</table>
 <div class="muted" style="margin-top:6px">Tap a day to see every problem - what she got right and wrong.</div></div>"""
 
-    body = f"""
-<h1>Goldie's math progress</h1>
-<div class="sub">Parent view - skills from Mrs. Derderian: times tables, 2x2-digit, 3x2-digit multiplication</div>
+    return f"""
 {statgrid}
 {weak}
 {skills_html}
 {sess_html}
+"""
+
+def parent_page(con):
+    body = f"""
+<h1>Goldie's math progress</h1>
+<div class="sub">Parent view - skills from Mrs. Derderian: times tables, 2x2-digit, 3x2-digit multiplication</div>
+{parent_sections(con)}
 """
     return PAGE.format(title="Goldie's progress", body=body)
 
@@ -458,7 +477,7 @@ def parent_session_page(con, sid):
                  f"<td>{gcell}</td><td>{mark}</td><td>{tcell}</td></tr>")
     body = f"""
 <h1>{fmt_day(s[0])} - {right} of {PROBLEMS_PER_DAY} right</h1>
-<div class="sub">{first} on the first try &middot; <a href="/parent/{PARENT_TOKEN}">back to overview</a></div>
+<div class="sub">{first} on the first try &middot; <a href="/parent/{PARENT_TOKEN}">back to the dashboard</a></div>
 <div class="card"><table>
 <tr><th>Problem</th><th>Skill</th><th>Her answer</th><th></th><th>Time</th></tr>
 {rows}
@@ -489,6 +508,20 @@ def do_get(h, parts, msg):
                 h._send(200, page)
         elif parts == ["parent", PARENT_TOKEN]:
             h._send(200, parent_page(con))
+        elif len(parts) == 4 and parts[0] == "parent" and parts[1] == PARENT_TOKEN and parts[2] == "jsession":
+            try:
+                sid = int(parts[3])
+            except ValueError:
+                sid = -1
+            jcon = josie_app.db()
+            try:
+                page = josie_app.session_page(jcon, sid, PARENT_TOKEN)
+            finally:
+                jcon.close()
+            if page is None:
+                h._send(404, "not found", "text/plain")
+            else:
+                h._send(200, page)
         elif len(parts) == 4 and parts[0] == "parent" and parts[1] == PARENT_TOKEN and parts[2] == "session":
             try:
                 sid = int(parts[3])
@@ -505,6 +538,14 @@ def do_get(h, parts, msg):
         con.close()
 
 def do_post(h, parts):
+    if len(parts) == 3 and parts[0] == "g" and parts[1] == GOLDIE_TOKEN and parts[2] == "reading":
+        rcon = reading_app.db()
+        try:
+            new = reading_app.mark_today(rcon, "goldie")
+        finally:
+            rcon.close()
+        h._redirect(f"/g/{GOLDIE_TOKEN}", "+Reading logged - nice job!" if new else "Reading was already logged today.")
+        return
     con = db()
     try:
         if len(parts) == 3 and parts[0] == "g" and parts[1] == GOLDIE_TOKEN and parts[2] == "start":
@@ -554,6 +595,19 @@ def do_post(h, parts):
                     con.execute("UPDATE problems SET attempts=? WHERE id=?", (attempts, p["id"]))
                     con.commit()
                     h._redirect(f"/g/{GOLDIE_TOKEN}/play")
+        elif len(parts) == 4 and parts[0] == "parent" and parts[1] == PARENT_TOKEN and parts[2] == "del_jsession":
+            try:
+                sid = int(parts[3])
+            except ValueError:
+                sid = -1
+            jcon = josie_app.db()
+            try:
+                jcon.execute("DELETE FROM problems WHERE session_id=?", (sid,))
+                jcon.execute("DELETE FROM sessions WHERE id=?", (sid,))
+                jcon.commit()
+            finally:
+                jcon.close()
+            h._redirect(f"/parent/{PARENT_TOKEN}", "Josie's session deleted")
         elif len(parts) == 4 and parts[0] == "parent" and parts[1] == PARENT_TOKEN and parts[2] == "del_session":
             try:
                 sid = int(parts[3])
