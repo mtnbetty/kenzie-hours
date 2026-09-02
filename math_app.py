@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from zoneinfo import ZoneInfo
 
-import reading_app, josie_app
+import reading_app, josie_app, chores_app
 
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 DB_PATH = os.path.join(DATA_DIR, "math.db")
@@ -286,6 +286,11 @@ def goldie_home(con, msg=None):
         rcon.close()
     reading_card = reading_app.kid_card(gbase, "goldie", r_already, r_streak,
                                         "I read for 30 minutes! &#128214;")
+    ccon = chores_app.db()
+    try:
+        chores_card = chores_app.kid_card(ccon, gbase, "goldie")
+    finally:
+        ccon.close()
     streak_line = ""
     if st > 0:
         streak_line = f'<div class="status">&#128293; <b>{st}-day streak!</b> &nbsp; &#11088; {stars} stars earned</div>'
@@ -305,6 +310,7 @@ def goldie_home(con, msg=None):
   ({first} on the first try).</div>
   <div class="muted">Come back tomorrow to keep your streak going. Your mom can see how you did.</div>
 </div>
+{chores_card}
 {reading_card}
 {{confetti}}"""
         return PAGE.format(title="Goldie Math", body=body.format(confetti=CONFETTI_JS, reading_card=reading_card))
@@ -322,6 +328,7 @@ def goldie_home(con, msg=None):
   <div class="muted center" style="margin-bottom:12px">{done} of {PROBLEMS_PER_DAY} done - keep going!</div>
   <form method="post" action="{gbase}/play"><button class="bigbtn" type="submit">Keep going</button></form>
 </div>
+{chores_card}
 {reading_card}"""
         return PAGE.format(title="Goldie Math", body=body)
 
@@ -345,6 +352,7 @@ def goldie_home(con, msg=None):
     &#10148; {N_3X2} big ones: three-digit times two-digit
   </div>
 </div>
+{chores_card}
 {reading_card}"""
     return PAGE.format(title="Goldie Math", body=body)
 
@@ -545,6 +553,18 @@ def do_post(h, parts):
         finally:
             rcon.close()
         h._redirect(f"/g/{GOLDIE_TOKEN}", "+Reading logged - nice job!" if new else "Reading was already logged today.")
+        return
+    if len(parts) == 3 and parts[0] == "g" and parts[1] == GOLDIE_TOKEN and parts[2] == "chore":
+        f = h._post_fields()
+        ccon = chores_app.db()
+        try:
+            done = chores_app.toggle(ccon, int(f.get("task_id", "0") or 0), "goldie")
+        finally:
+            ccon.close()
+        if done is None:
+            h._redirect(f"/g/{GOLDIE_TOKEN}", "!That task isn't on your list today")
+        else:
+            h._redirect(f"/g/{GOLDIE_TOKEN}", "+Nice - task done!" if done else "Marked as not done.")
         return
     con = db()
     try:
