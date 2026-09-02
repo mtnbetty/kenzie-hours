@@ -14,6 +14,7 @@ DB_PATH = os.path.join(DATA_DIR, "hours.db")
 TOKENS_PATH = os.path.join(DATA_DIR, "tokens.json")
 TZ = ZoneInfo("America/Denver")
 PORT = int(os.environ.get("PORT", "8080"))
+HOURLY_RATE_CENTS = int(os.environ.get("HOURLY_RATE_CENTS", "2000"))  # Kenzie's rate: $20/hr
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -29,6 +30,11 @@ def db():
         amount_cents INTEGER NOT NULL,
         note TEXT NOT NULL,
         filename TEXT NOT NULL)""")
+    for table in ("time_entries", "receipts"):
+        cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+        if "paid" not in cols:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN paid INTEGER NOT NULL DEFAULT 0")
+    con.commit()
     return con
 
 def load_tokens():
@@ -78,6 +84,15 @@ def dur_str(seconds):
 
 def money(cents):
     return f"${cents/100:,.2f}"
+
+def wages_cents(seconds):
+    return int(round(HOURLY_RATE_CENTS * seconds / 3600))
+
+def paid_checkbox(bbase, kind, rid, paid):
+    return (f'<form method="post" action="{bbase}/toggle_paid" style="display:inline">'
+            f'<input type="hidden" name="kind" value="{kind}">'
+            f'<input type="hidden" name="id" value="{rid}">'
+            f'<input type="checkbox" class="paidbox" title="Mark paid" onchange="this.form.submit()" {"checked" if paid else ""}></form>')
 
 PAGE = """<!DOCTYPE html>
 <html lang="en"><head>
@@ -130,13 +145,13 @@ def open_entry(con):
     return con.execute("SELECT id, clock_in FROM time_entries WHERE clock_out IS NULL ORDER BY id DESC LIMIT 1").fetchone()
 
 def entries_with_durations(con):
-    rows = con.execute("SELECT id, clock_in, clock_out FROM time_entries ORDER BY clock_in DESC").fetchall()
+    rows = con.execute("SELECT id, clock_in, clock_out, paid FROM time_entries ORDER BY clock_in DESC").fetchall()
     out = []
     now = now_utc()
-    for rid, ci, co in rows:
+    for rid, ci, co, paid in rows:
         ci_dt, co_dt = parse(ci), parse(co) if co else None
         secs = ((co_dt or now) - ci_dt).total_seconds()
-        out.append({"id": rid, "in": ci_dt, "out": co_dt, "secs": secs, "open": co_dt is None})
+        out.append({"id": rid, "in": ci_dt, "out": co_dt, "secs": secs, "open": co_dt is None, "paid": bool(paid)})
     return out
 
 def group_weeks(entries):
@@ -227,6 +242,9 @@ def boss_sections(con):
     entries = entries_with_durations(con)
     weeks = group_weeks(entries)
 
+    unpaid_secs = sum(e["secs"] for e in entries if not e["paid"])
+    unpaid_hours_c = wages_cents(unpaid_secs)
+
     oe = open_entry(con)
     status_html = ""
     if oe:
@@ -237,40 +255,58 @@ def boss_sections(con):
     wk_html = ""
     for ws, es in weeks:
         total = sum(e["secs"] for e in es)
+        wk_unpaid = sum(e["secs"] for e in es if not e["paid"])
         rows = ""
         for e in sorted(es, key=lambda x: x["in"]):
             out_cell = fmt_time(e["out"]) if e["out"] else "<b>still in</b>"
-            rows += (f"<tr><td>{fmt_day(e['in'])}</td><td>{fmt_time(e['in'])}</td><td>{out_cell}</td>"
+            rowcls = ' class="paidrow"' if e["paid"] else ""
+            rows += (f"<tr{rowcls}><td>{fmt_day(e['in'])}</td><td>{fmt_time(e['in'])}</td><td>{out_cell}</td>"
                      f"<td>{dur_str(e['secs'])}</td>"
+                     f"<td>{paid_checkbox(bbase, 'entry', e['id'], e['paid'])}</td>"
                      f'<td><form method="post" action="{bbase}/del_entry" onsubmit="return confirm(\'Delete this shift?\')">'
                      f'<input type="hidden" name="id" value="{e["id"]}"><button class="delbtn" title="Delete">&#10005;</button></form></td></tr>')
         wk_html += f"""<div class="card"><table>
-<tr class="weekhead"><td colspan="5">Week of {ws.strftime("%b %-d, %Y")}</td></tr>
-<tr><th>Day</th><th>In</th><th>Out</th><th>Hours</th><th></th></tr>
+<tr class="weekhead"><td colspan="6">Week of {ws.strftime("%b %-d, %Y")}</td></tr>
+<tr><th>Day</th><th>In</th><th>Out</th><th>Hours</th><th>Paid</th><th></th></tr>
 {rows}
-<tr class="totalrow"><td colspan="3">Total</td><td>{dur_str(total)}</td><td></td></tr>
+<tr class="totalrow"><td colspan="3">Total</td><td>{dur_str(total)}</td><td colspan="2" class="muted">unpaid {dur_str(wk_unpaid)} = {money(wages_cents(wk_unpaid))}</td></tr>
 </table></div>"""
     if not wk_html:
         wk_html = '<div class="card muted">No shifts logged yet.</div>'
 
-    receipts = con.execute("SELECT id, created, amount_cents, note FROM receipts ORDER BY id DESC").fetchall()
+    receipts = con.execute("SELECT id, created, amount_cents, note, paid FROM receipts ORDER BY id DESC").fetchall()
     total_c = sum(r[2] for r in receipts)
+    unpaid_receipts_c = sum(r[2] for r in receipts if not r[4])
     rrows = ""
-    for rid, c, a, n in receipts:
-        rrows += (f'<tr><td><a href="photo/{rid}" target="_blank"><img class="thumb" src="photo/{rid}" loading="lazy"></a></td>'
+    for rid, c, a, n, p in receipts:
+        rowcls = ' class="paidrow"' if p else ""
+        rrows += (f'<tr{rowcls}><td><a href="photo/{rid}" target="_blank"><img class="thumb" src="photo/{rid}" loading="lazy"></a></td>'
                   f"<td>{fmt_dt(parse(c))}</td><td>{money(a)}</td><td>{esc(n)}</td>"
+                  f"<td>{paid_checkbox(bbase, 'receipt', rid, bool(p))}</td>"
                   f'<td><form method="post" action="{bbase}/del_receipt" onsubmit="return confirm(\'Delete this receipt?\')">'
                   f'<input type="hidden" name="id" value="{rid}"><button class="delbtn" title="Delete">&#10005;</button></form></td></tr>')
     if not rrows:
-        rrows = '<tr><td colspan="5" class="muted">No receipts submitted yet.</td></tr>'
+        rrows = '<tr><td colspan="6" class="muted">No receipts submitted yet.</td></tr>'
+
+    owed_c = unpaid_hours_c + unpaid_receipts_c
+    balance_html = f"""<div class="card">
+<h2 style="margin-top:0">Unpaid balance: {money(owed_c)}</h2>
+<div class="statgrid">
+  <div class="stat"><div class="n">{money(unpaid_hours_c)}</div><div class="l">Hours owed</div></div>
+  <div class="stat"><div class="n">{dur_str(unpaid_secs)}</div><div class="l">Unpaid hours</div></div>
+  <div class="stat"><div class="n">{money(unpaid_receipts_c)}</div><div class="l">Receipts owed</div></div>
+</div>
+<div class="muted">Hours at {money(HOURLY_RATE_CENTS)}/hr. Check off shifts &amp; receipts below as you pay her; the balance is whatever's left.</div>
+</div>"""
 
     return f"""
+{balance_html}
 {status_html}
 <h2>Hours by week</h2>
 {wk_html}
-<h2>Receipts <span class="muted">(total {money(total_c)})</span></h2>
+<h2>Receipts <span class="muted">(total {money(total_c)}, unpaid {money(unpaid_receipts_c)})</span></h2>
 <div class="card"><table>
-<tr><th>Photo</th><th>When</th><th>Amount</th><th>Note</th><th></th></tr>
+<tr><th>Photo</th><th>When</th><th>Amount</th><th>Note</th><th>Paid</th><th></th></tr>
 {rrows}
 </table></div>
 """
@@ -309,6 +345,9 @@ th {{ color: #777; font-weight: 600; font-size: .8rem; text-transform: uppercase
 .delbtn {{ border: 0; background: none; color: #c00; font-size: 1rem; cursor: pointer; padding: 4px; }}
 .muted {{ color: #888; font-size: .85rem; }}
 .weekhead {{ background: #eceff3; font-weight: 700; }}
+.paidrow td {{ color: #9aa0a6; }}
+.paidrow td a {{ color: #9aa0a6; }}
+.paidbox {{ width: 20px; height: 20px; accent-color: #1faa55; cursor: pointer; }}
 .statgrid {{ display: flex; gap: 10px; margin-bottom: 14px; }}
 .stat {{ flex: 1; background: #fff; border-radius: 14px; padding: 14px 10px; text-align: center;
   box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
@@ -636,6 +675,15 @@ class H(BaseHTTPRequestHandler):
                             (iso(now_utc()), int(round(amount * 100)), note, fname))
                 con.commit()
                 self._redirect(f"/k/{KENZIE_TOKEN}", f"Receipt saved - {money(int(round(amount*100)))}")
+            elif len(parts) == 3 and parts[0] == "boss" and parts[1] == BOSS_TOKEN and parts[2] == "toggle_paid":
+                f = self._post_fields()
+                rid = int(f.get("id", "0") or 0)
+                if f.get("kind") == "receipt":
+                    con.execute("UPDATE receipts SET paid = 1 - paid WHERE id=?", (rid,))
+                else:
+                    con.execute("UPDATE time_entries SET paid = 1 - paid WHERE id=?", (rid,))
+                con.commit()
+                self._redirect(dash_back(self), "Payment status updated")
             elif len(parts) == 3 and parts[0] == "boss" and parts[1] == BOSS_TOKEN and parts[2] in ("del_entry", "del_receipt"):
                 ln = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(ln).decode()
