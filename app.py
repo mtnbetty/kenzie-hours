@@ -163,13 +163,13 @@ def entries_with_durations(con):
     return out
 
 
-def edit_history(con):
-    rows = con.execute("SELECT entry_id,changed_at,old_in,old_out,new_in,new_out,reason,paid_at_edit FROM hour_edits ORDER BY id DESC").fetchall()
+def edit_history(con, can_undo=False):
+    rows = con.execute("SELECT entry_id,changed_at,old_in,old_out,new_in,new_out,reason,paid_at_edit,id FROM hour_edits ORDER BY id DESC").fetchall()
     if not rows:
         return ""
     def span(ci, co):
         return (fmt_dt(parse(ci)) + " to " + (fmt_dt(parse(co)) if co else "still clocked in")) if ci else "Missed shift (new entry)"
-    body = "".join(f'<div class="editnote"><b>Shift #{rid}</b> - {esc(fmt_dt(parse(at)))}<br>Before: {esc(span(oi,oo))}<br>After: {esc(span(ni,no))}<br>Reason: {esc(reason)}' + ('<br><b>Already marked paid; payment status unchanged.</b>' if paid else '') + '</div>' for rid,at,oi,oo,ni,no,reason,paid in rows)
+    body = "".join(f'<div class="editnote"><b>Shift #{rid}</b> - {esc(fmt_dt(parse(at)))}<br>Before: {esc(span(oi,oo))}<br>After: {esc(span(ni,no))}<br>Reason: {esc(reason)}' + ('<br><b>Already marked paid; payment status unchanged.</b>' if paid else '') + (f'<form method="post" action="/k/{KENZIE_TOKEN}/undo_hours"><input type="hidden" name="edit_id" value="{hid}"><input type="hidden" name="version" value="{edit_stamp(rid,ni,no)}"><button type="submit">Undo this correction</button></form>' if can_undo and oi and con.execute('SELECT clock_in,clock_out FROM time_entries WHERE id=?',(rid,)).fetchone()==(ni,no) else '') + '</div>' for rid,at,oi,oo,ni,no,reason,paid,hid in rows)
     return f'<div class="card"><details><summary>Hours correction history ({len(rows)})</summary>{body}</details></div>'
 
 def edit_stamp(rid, ci, co):
@@ -242,6 +242,11 @@ def save_hours(con, f):
             if ci < (parse(other_out) if other_out else now) and parse(other_in) < (co or now):
                 raise ValueError(f"These hours overlap shift #{eid}. Edit that shift instead or check the dates.")
         ni, no = iso(ci), iso(co) if co else None
+        # Preserve subsecond precision when a displayed second was not edited.
+        if oi and parse(oi).replace(microsecond=0) == ci.replace(microsecond=0):
+            ni = oi
+        if oo and co and parse(oo).replace(microsecond=0) == co.replace(microsecond=0):
+            no = oo
         if ni == oi and no == oo:
             raise ValueError("The times have not changed.")
         if rid == "new":
@@ -306,7 +311,7 @@ def kenzie_page(con, flash=None):
     log = f"""<h2>Your shifts</h2><div class="card"><p class="muted" style="margin-bottom:12px">Missed a clock-in or clock-out? Edit a shift below. Changes save right away, with the original times kept in history.</p>
       <p style="margin-bottom:12px"><a href="{kbase}/edit/new">Add a missed shift</a></p><table>
       <tr><th>Day</th><th>In</th><th>Out</th><th>Time</th><th></th></tr>{rows or '<tr><td colspan=5 class="muted">No shifts yet</td></tr>'}
-      </table></div>""" + edit_history(con)
+      </table></div>""" + edit_history(con, can_undo=True)
 
     receipts = con.execute("SELECT created, amount_cents, note FROM receipts ORDER BY id DESC LIMIT 5").fetchall()
     rrows = "".join(f"<tr><td>{fmt_dt(parse(c))}</td><td>{money(a)}</td><td>{esc(n)}</td></tr>" for c, a, n in receipts)
@@ -701,6 +706,30 @@ class H(BaseHTTPRequestHandler):
                     msg = "Clocked in - have a great shift!"
                 con.commit()
                 self._redirect(f"/k/{KENZIE_TOKEN}", msg)
+            elif parts == ["k", KENZIE_TOKEN, "undo_hours"]:
+                f = self._post_fields()
+                con.execute("BEGIN IMMEDIATE")
+                row = con.execute("SELECT entry_id,old_in,old_out,new_in,new_out FROM hour_edits WHERE id=?",(f.get("edit_id"),)).fetchone()
+                if not row or not row[1]:
+                    con.rollback()
+                    self._redirect(f"/k/{KENZIE_TOKEN}", "!That correction cannot be undone.")
+                    return
+                rid,oi,oo,ni,no = row
+                current = con.execute("SELECT clock_in,clock_out,paid FROM time_entries WHERE id=?",(rid,)).fetchone()
+                if not current or current[:2] != (ni,no) or not hmac.compare_digest(f.get("version",""),edit_stamp(rid,ni,no)):
+                    con.rollback()
+                    self._redirect(f"/k/{KENZIE_TOKEN}", "!This shift has changed. Open it again.")
+                    return
+                # Undo cannot overlap a different shift or create a second running timer.
+                conflict = any(str(eid)!=str(rid) and parse(oi)<(parse(co) if co else now_utc()) and parse(ci)<(parse(oo) if oo else now_utc()) for eid,ci,co in con.execute("SELECT id,clock_in,clock_out FROM time_entries"))
+                if conflict:
+                    con.rollback()
+                    self._redirect(f"/k/{KENZIE_TOKEN}", "!Undo would overlap another shift. Edit the times instead.")
+                    return
+                con.execute("UPDATE time_entries SET clock_in=?,clock_out=? WHERE id=?",(oi,oo,rid))
+                con.execute("INSERT INTO hour_edits(entry_id,changed_at,old_in,old_out,new_in,new_out,reason,paid_at_edit) VALUES (?,?,?,?,?,?,?,?)",(rid,iso(now_utc()),ni,no,oi,oo,"Undid correction #"+str(f.get("edit_id")),current[2]))
+                con.commit()
+                self._redirect(f"/k/{KENZIE_TOKEN}", "Correction undone. Previous times restored exactly.")
             elif parts == ["k", KENZIE_TOKEN, "save_hours"]:
                 try:
                     save_hours(con, self._post_fields())
