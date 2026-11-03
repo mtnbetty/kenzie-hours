@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tiny time tracker for Kenzie + Kristy. Stdlib-only (Python 3.10-3.12)."""
-import os, io, json, sqlite3, secrets, cgi, mimetypes
+import os, io, json, sqlite3, secrets, cgi, mimetypes, hashlib, hmac
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -34,6 +34,11 @@ def db():
         cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
         if "paid" not in cols:
             con.execute(f"ALTER TABLE {table} ADD COLUMN paid INTEGER NOT NULL DEFAULT 0")
+    con.execute("""CREATE TABLE IF NOT EXISTS hour_edits(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, entry_id INTEGER NOT NULL,
+        changed_at TEXT NOT NULL, old_in TEXT, old_out TEXT,
+        new_in TEXT NOT NULL, new_out TEXT, reason TEXT NOT NULL,
+        paid_at_edit INTEGER NOT NULL DEFAULT 0)""")
     con.commit()
     return con
 
@@ -115,6 +120,9 @@ h2 {{ font-size: 1.05rem; margin: 24px 0 8px; color: #444; }}
 .status b {{ font-weight: 700; }}
 .timer {{ text-align: center; font-size: 2rem; font-weight: 700; margin: 6px 0 16px;
   font-variant-numeric: tabular-nums; }}
+input[type=datetime-local], textarea {{ width:100%; max-width:100%; padding:12px; border:1px solid #bbb; border-radius:8px; font:inherit; margin:6px 0 12px; }}
+.editnote {{ padding:10px 0; border-bottom:1px solid #eee; line-height:1.5; font-size:.9rem; overflow-wrap:anywhere; }}
+a {{ color:#245bc7; }}
 table {{ width: 100%; border-collapse: collapse; font-size: .92rem; }}
 th, td {{ text-align: left; padding: 7px 6px; border-bottom: 1px solid #eee; }}
 th {{ color: #777; font-weight: 600; font-size: .8rem; text-transform: uppercase; }}
@@ -153,6 +161,100 @@ def entries_with_durations(con):
         secs = ((co_dt or now) - ci_dt).total_seconds()
         out.append({"id": rid, "in": ci_dt, "out": co_dt, "secs": secs, "open": co_dt is None, "paid": bool(paid)})
     return out
+
+
+def edit_history(con):
+    rows = con.execute("SELECT entry_id,changed_at,old_in,old_out,new_in,new_out,reason,paid_at_edit FROM hour_edits ORDER BY id DESC").fetchall()
+    if not rows:
+        return ""
+    def span(ci, co):
+        return (fmt_dt(parse(ci)) + " to " + (fmt_dt(parse(co)) if co else "still clocked in")) if ci else "Missed shift (new entry)"
+    body = "".join(f'<div class="editnote"><b>Shift #{rid}</b> - {esc(fmt_dt(parse(at)))}<br>Before: {esc(span(oi,oo))}<br>After: {esc(span(ni,no))}<br>Reason: {esc(reason)}' + ('<br><b>Already marked paid; payment status unchanged.</b>' if paid else '') + '</div>' for rid,at,oi,oo,ni,no,reason,paid in rows)
+    return f'<div class="card"><details><summary>Hours correction history ({len(rows)})</summary>{body}</details></div>'
+
+def edit_stamp(rid, ci, co):
+    return hmac.new(KENZIE_TOKEN.encode(), json.dumps([str(rid),ci,co]).encode(), hashlib.sha256).hexdigest()
+
+def edit_form(con, rid):
+    row = None if rid == "new" else con.execute("SELECT clock_in,clock_out,paid FROM time_entries WHERE id=?", (rid,)).fetchone()
+    if rid != "new" and not row:
+        return None
+    ci, co, paid = row if row else (None,None,0)
+    def val(t):
+        return local(parse(t)).strftime("%Y-%m-%dT%H:%M:%S") if t else ""
+    kbase = "/k/" + KENZIE_TOKEN
+    note = '<p class="flash err">This shift is already marked paid. Saving changes the hours, not its payment status. Mom can review the difference in history.</p>' if paid else ''
+    blank = '<p class="muted">Leave clock-out blank only if you are still working this shift.</p>' if row and co is None else ''
+    body = f"""<h1>{'Add a missed shift' if rid == 'new' else 'Edit shift'}</h1>
+<p class="sub">All times are Mountain Time (America/Denver).</p>
+{note}<div class="card"><form method="post" action="{kbase}/save_hours">
+<input type="hidden" name="id" value="{esc(rid)}"><input type="hidden" name="version" value="{edit_stamp(rid,ci,co)}">
+<label for="clock_in">Clock-in date and time</label><input id="clock_in" type="datetime-local" step="1" name="clock_in" value="{val(ci)}" required>
+<label for="clock_out">Clock-out date and time</label><input id="clock_out" type="datetime-local" step="1" name="clock_out" value="{val(co)}" {'' if row and co is None else 'required'}>
+{blank}<label for="reason">What needs correcting?</label><input id="reason" name="reason" type="text" maxlength="300" placeholder="Forgot to clock out" required>
+<p class="muted">Changes save immediately. The original times stay in history.</p>
+<button class="subbtn" type="submit">Save hours</button></form></div><p><a href="{kbase}">Cancel - back to your shifts</a></p>"""
+    return PAGE.format(title="Edit hours - Kenzie", body=body)
+
+def local_input(value):
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo or 'T' not in value:
+            raise ValueError()
+        dt0, dt1 = dt.replace(tzinfo=TZ,fold=0), dt.replace(tzinfo=TZ,fold=1)
+        if local(dt0.astimezone(timezone.utc)).replace(tzinfo=None) != dt:
+            raise ValueError("That time does not exist during the daylight-saving change.")
+        if dt0.utcoffset() != dt1.utcoffset():
+            raise ValueError("That time is ambiguous during the daylight-saving change. Use a time outside the repeated hour.")
+        return dt0.astimezone(timezone.utc)
+    except (TypeError, ValueError) as e:
+        raise ValueError(str(e) or "Enter a valid date and time.")
+
+def save_hours(con, f):
+    rid = f.get("id", "")
+    if rid != "new" and not rid.isdigit():
+        raise ValueError("Shift not found.")
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        row = None if rid == "new" else con.execute("SELECT clock_in,clock_out,paid FROM time_entries WHERE id=?", (rid,)).fetchone()
+        if rid != "new" and not row:
+            raise ValueError("Shift not found.")
+        oi, oo, paid = row if row else (None,None,0)
+        stamp = f.get("version", "")
+        if not hmac.compare_digest(stamp, edit_stamp(rid,oi,oo)):
+            raise ValueError("This shift changed or this form was already saved. Open Edit again before saving.")
+        reason = f.get("reason", "").strip()
+        if not reason or len(reason)>300:
+            raise ValueError("Add a short reason (up to 300 characters).")
+        ci = local_input(f.get("clock_in", ""))
+        co = local_input(f["clock_out"]) if f.get("clock_out") else None
+        now = now_utc()
+        if ci > now or (co and co > now):
+            raise ValueError("Hours cannot be in the future.")
+        if co and co <= ci:
+            raise ValueError("Clock-out must be after clock-in. Check both dates.")
+        if co is None and (not row or oo is not None):
+            raise ValueError("Enter a clock-out time for this shift.")
+        # Prevent overlapping or duplicate shifts, including the running timer.
+        for eid, other_in, other_out in con.execute("SELECT id,clock_in,clock_out FROM time_entries"):
+            if str(eid) == rid:
+                continue
+            if ci < (parse(other_out) if other_out else now) and parse(other_in) < (co or now):
+                raise ValueError(f"These hours overlap shift #{eid}. Edit that shift instead or check the dates.")
+        ni, no = iso(ci), iso(co) if co else None
+        if ni == oi and no == oo:
+            raise ValueError("The times have not changed.")
+        if rid == "new":
+            # The transactional overlap check prevents duplicate completed shifts.
+            rid = con.execute("INSERT INTO time_entries(clock_in,clock_out) VALUES (?,?)", (ni,no)).lastrowid
+        else:
+            con.execute("UPDATE time_entries SET clock_in=?,clock_out=? WHERE id=?", (ni,no,rid))
+        con.execute("INSERT INTO hour_edits(entry_id,changed_at,old_in,old_out,new_in,new_out,reason,paid_at_edit) VALUES (?,?,?,?,?,?,?,?)", (rid,iso(now),oi,oo,ni,no,reason,paid))
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    return rid
 
 def group_weeks(entries):
     weeks = {}
@@ -195,14 +297,16 @@ def kenzie_page(con, flash=None):
         timer = ""
     fl = f'<div class="flash {"err" if flash and flash.startswith("!") else ""}">{esc(flash.lstrip("!"))}</div>' if flash else ""
 
-    recent = entries_with_durations(con)[:7]
+    recent = entries_with_durations(con)
     rows = "".join(
         f"<tr><td>{fmt_day(e['in'])}</td><td>{fmt_time(e['in'])}</td>"
-        f"<td>{fmt_time(e['out']) if e['out'] else '<b>now</b>'}</td><td>{dur_str(e['secs'])}</td></tr>"
+        f"<td>{fmt_time(e['out']) if e['out'] else '<b>now</b>'}</td><td>{dur_str(e['secs'])}</td>"
+        f'<td><a href="{kbase}/edit/{e["id"]}">Edit</a></td></tr>'
         for e in recent)
-    log = f"""<h2>Your recent shifts</h2><div class="card"><table>
-      <tr><th>Day</th><th>In</th><th>Out</th><th>Time</th></tr>{rows or '<tr><td colspan=4 class="muted">No shifts yet</td></tr>'}
-      </table></div>"""
+    log = f"""<h2>Your shifts</h2><div class="card"><p class="muted" style="margin-bottom:12px">Missed a clock-in or clock-out? Edit a shift below. Changes save right away, with the original times kept in history.</p>
+      <p style="margin-bottom:12px"><a href="{kbase}/edit/new">Add a missed shift</a></p><table>
+      <tr><th>Day</th><th>In</th><th>Out</th><th>Time</th><th></th></tr>{rows or '<tr><td colspan=5 class="muted">No shifts yet</td></tr>'}
+      </table></div>""" + edit_history(con)
 
     receipts = con.execute("SELECT created, amount_cents, note FROM receipts ORDER BY id DESC LIMIT 5").fetchall()
     rrows = "".join(f"<tr><td>{fmt_dt(parse(c))}</td><td>{money(a)}</td><td>{esc(n)}</td></tr>" for c, a, n in receipts)
@@ -302,6 +406,7 @@ def boss_sections(con):
     return f"""
 {balance_html}
 {status_html}
+{edit_history(con)}
 <h2>Hours by week</h2>
 {wk_html}
 <h2>Receipts <span class="muted">(total {money(total_c)}, unpaid {money(unpaid_receipts_c)})</span></h2>
@@ -334,6 +439,9 @@ h2 {{ font-size: 1.05rem; margin: 26px 0 8px; color: #444; padding-top: 8px; }}
 .status {{ text-align: center; font-size: 1.05rem; margin-bottom: 14px; }}
 .timer {{ text-align: center; font-size: 2rem; font-weight: 700; margin: 6px 0 16px;
   font-variant-numeric: tabular-nums; }}
+input[type=datetime-local], textarea {{ width:100%; max-width:100%; padding:12px; border:1px solid #bbb; border-radius:8px; font:inherit; margin:6px 0 12px; }}
+.editnote {{ padding:10px 0; border-bottom:1px solid #eee; line-height:1.5; font-size:.9rem; overflow-wrap:anywhere; }}
+a {{ color:#245bc7; }}
 table {{ width: 100%; border-collapse: collapse; font-size: .92rem; }}
 th, td {{ text-align: left; padding: 7px 6px; border-bottom: 1px solid #eee; }}
 th {{ color: #777; font-weight: 600; font-size: .8rem; text-transform: uppercase; }}
@@ -540,6 +648,9 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, "ok", "text/plain")
             elif parts == ["k", KENZIE_TOKEN]:
                 self._send(200, kenzie_page(con, msg))
+            elif len(parts) == 4 and parts[:2] == ["k", KENZIE_TOKEN] and parts[2] == "edit":
+                page = edit_form(con, parts[3])
+                self._send(200 if page else 404, page or "Shift not found")
             elif len(parts) == 4 and parts[0] == "boss" and parts[1] == BOSS_TOKEN and parts[2] == "chore_edit":
                 try:
                     tid = int(parts[3])
@@ -590,6 +701,13 @@ class H(BaseHTTPRequestHandler):
                     msg = "Clocked in - have a great shift!"
                 con.commit()
                 self._redirect(f"/k/{KENZIE_TOKEN}", msg)
+            elif parts == ["k", KENZIE_TOKEN, "save_hours"]:
+                try:
+                    save_hours(con, self._post_fields())
+                except ValueError as e:
+                    self._redirect(f"/k/{KENZIE_TOKEN}", "!" + str(e))
+                    return
+                self._redirect(f"/k/{KENZIE_TOKEN}", "Hours saved. The original times are kept in history.")
             elif len(parts) == 3 and parts[0] == "k" and parts[1] == KENZIE_TOKEN and parts[2] == "chore":
                 f = self._post_fields()
                 ccon = chores_app.db()
